@@ -1,61 +1,84 @@
 // Public relay for the Proof Gatekeeper agent: Render free web service.
-// Platform traffic hits this public URL; it is forwarded over a persistent
-// WebSocket to the agent server running on the VM, and responses come back.
+// Plain-HTTPS long-polling design (the VM's egress policy blocks WebSocket
+// upgrades, so no WebSocket is used anywhere).
+//
+// Platform -> relay: any HTTP request (except /healthz, /poll, /result).
+//   It is queued and handed to the VM client on its next GET /poll.
+// VM client -> relay: GET /poll (held up to 45s), then POST /result {id,...}.
+// Relay -> platform: the client's result, or 502 on timeout.
 // No secrets here. Start: node server.js (PORT env, default 10000).
 const http = require('http');
 const crypto = require('crypto');
-const { WebSocketServer } = require('ws');
 
 const PORT = Number(process.env.PORT || 10000);
-let client = null; // active VM-side WebSocket
-const pending = new Map(); // id -> { resolve, timer }
+const WAIT_TIMEOUT_MS = 55000; // platform request waits this long for a result
+const POLL_TIMEOUT_MS = 45000; // client poll held this long when idle
 
-function sendToClient(msg) {
-  return new Promise((resolve, reject) => {
-    if (!client || client.readyState !== 1) return reject(new Error('no vm client connected'));
-    const id = crypto.randomUUID();
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error('vm timeout')); }, 55000);
-    pending.set(id, { resolve, timer });
-    client.send(JSON.stringify({ ...msg, id }));
-  });
+// id -> { resolve, timer } for platform requests waiting on a result
+const waiters = new Map();
+// [{ res, timer }] polls waiting for a platform request
+const polls = [];
+// platform requests queued while no poll is waiting: [{ id, req }]
+const queued = [];
+let lastPollAt = 0;
+
+function deliverNext() {
+  while (polls.length && queued.length) {
+    const poll = polls.shift();
+    clearTimeout(poll.timer);
+    const q = queued.shift();
+    poll.res.writeHead(200, { 'content-type': 'application/json' });
+    poll.res.end(JSON.stringify({ type: 'http', id: q.id, method: q.req.method, url: q.req.url, headers: q.req.headers, body: q.req.body }));
+  }
 }
 
-const wss = new WebSocketServer({ noServer: true });
-wss.on('connection', (ws) => {
-  client = ws;
-  console.log('vm client connected');
-  ws.on('message', (data) => {
-    let msg; try { msg = JSON.parse(String(data)); } catch { return; }
-    const p = pending.get(msg.id);
-    if (p) { clearTimeout(p.timer); pending.delete(msg.id); p.resolve(msg); }
-  });
-  ws.on('close', () => { if (client === ws) { client = null; console.log('vm client disconnected'); } });
-  ws.on('error', () => {});
-});
-
-const server = http.createServer(async (req, res) => {
-  if (req.url === '/healthz') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: true, service: 'gk-relay', vm: Boolean(client) })); }
+const server = http.createServer((req, res) => {
+  if (req.url === '/healthz') {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, service: 'gk-relay', vm: Date.now() - lastPollAt < 60000 }));
+  }
+  if (req.url === '/poll' && req.method === 'GET') {
+    lastPollAt = Date.now();
+    const timer = setTimeout(() => {
+      const i = polls.findIndex((p) => p.res === res);
+      if (i >= 0) polls.splice(i, 1);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'noop' }));
+    }, POLL_TIMEOUT_MS);
+    polls.push({ res, timer });
+    deliverNext();
+    return;
+  }
+  if (req.url === '/result' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      let msg; try { msg = JSON.parse(Buffer.concat(chunks).toString()); } catch { res.writeHead(400); return res.end(); }
+      const w = waiters.get(msg.id);
+      if (w) { clearTimeout(w.timer); waiters.delete(msg.id); w.resolve(msg); }
+      res.writeHead(200); res.end();
+    });
+    return;
+  }
+  // platform request: queue it, wait for the client result
   const chunks = [];
   req.on('data', (c) => chunks.push(c));
-  req.on('end', async () => {
-    const body = Buffer.concat(chunks);
-    try {
-      const reply = await sendToClient({
-        type: 'http', method: req.method, url: req.url,
-        headers: req.headers, body: body.toString('base64'),
-      });
+  req.on('end', () => {
+    const id = crypto.randomUUID();
+    const entry = { id, req: { method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks).toString('base64') } };
+    const promise = new Promise((resolve) => {
+      const timer = setTimeout(() => { waiters.delete(id); resolve(null); }, WAIT_TIMEOUT_MS);
+      waiters.set(id, { resolve, timer });
+    });
+    queued.push(entry);
+    deliverNext();
+    promise.then((reply) => {
+      if (!reply) { res.writeHead(502, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ ok: false, error: 'vm timeout' })); }
       const out = Buffer.from(reply.body || '', 'base64');
       res.writeHead(reply.status || 502, reply.headers || {});
       res.end(out);
-    } catch (e) {
-      res.writeHead(502, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: e.message }));
-    }
+    });
   });
 });
 
-server.on('upgrade', (req, socket, head) => {
-  if (req.url === '/relay') wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-  else socket.destroy();
-});
 server.listen(PORT, () => console.log('relay listening on ' + PORT));
