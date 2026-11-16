@@ -12,7 +12,7 @@ const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT || 10000);
 const WAIT_TIMEOUT_MS = 55000; // platform request waits this long for a result
-const POLL_TIMEOUT_MS = 45000; // client poll held this long when idle
+const POLL_TIMEOUT_MS = 3000; // client poll held this long when idle (short: the VM's egress proxy kills long-held connections within seconds)
 
 // id -> { resolve, timer } for platform requests waiting on a result
 const waiters = new Map();
